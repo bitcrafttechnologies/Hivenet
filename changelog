@@ -1,0 +1,160 @@
+# Hivenet changelog
+
+Every change to code, schema, dependencies or build process gets an entry here,
+written in the same session as the change. Newest first. Record the *why* —
+that's the part a diff can't recover later.
+
+---
+
+## 2026-08-07 — Project scaffold: build order steps 1–3
+
+First code in the repo. Covers steps 1, 2 and 3 of spec §11; the topology model,
+store, reconciler, HTTP/WebSocket layer and test suite all exist and run.
+No podman or netlink code yet — those are steps 4–6 and need the Linux VM.
+
+### Added
+
+**`CLAUDE.md`** — working reference for agents: repo layout, commands, the
+architecture invariants most likely to be broken by a reasonable-looking change,
+the networking gotchas from spec §6, and what is deliberately out of scope.
+
+**`Makefile`** — `make check` (vet + test + fmt) is the gate before calling work
+done. Sets `CGO_ENABLED=0` and `GOTOOLCHAIN=local`; see "Toolchain" below for why
+those aren't optional.
+
+**`internal/topology`** — the authoritative desired-state document (spec §4).
+Nodes, interfaces, links, version counter, deep clone, and validation that
+reports every problem at once with a field path per error so the UI can mark the
+offending field rather than showing one long string.
+
+Validation enforces the invariants the lower layers depend on:
+- IDs are unique and restricted to a path-safe charset — they end up in netns
+  symlink paths and podman labels.
+- Interface names cap at 15 chars (kernel `IFNAMSIZ`), rejected here where a
+  useful error can be shown rather than by netlink later.
+- An interface belongs to at most one link, because a veth end can only live in
+  one pair.
+
+**`internal/store`** — in-memory topology store plus the separate client-owned
+layout store, kept apart as spec §4 requires. Layout writes never bump the
+topology version and never trigger a reconcile.
+
+**`internal/reconcile`** — typed ops, the diff, and the debounce/coalesce engine
+(spec §5). The engine goroutine is the single writer for all driver state.
+
+**`internal/driver`** — the privileged seam. Interface only; no podman or
+netlink imports anywhere in the package. Also holds `VethName` (short hash, 13
+chars, so a long link ID can't blow the `IFNAMSIZ` cap) and the netns path
+helpers.
+
+**`internal/driver/fake`** — in-memory driver. Backs the whole test suite and
+every non-Linux dev session.
+
+**`internal/httpapi`** — REST + WebSocket + embedded frontend on one server.
+`GET/PUT /api/topology`, `GET/PUT /api/layout`, `GET /api/status`,
+`POST /api/reconcile`, `GET /ws`, `GET /ws/terminal` (501 until step 10),
+`/healthz`, and SPA-fallback static serving.
+
+**`internal/auth`** — the multi-tenancy seam from spec §8: an `Authenticator`
+interface with a no-op default that returns the constant owner. Middleware only;
+no sessions, no user management, no RBAC.
+
+**`web/`** — `go:embed` wrapper plus a placeholder `dist/index.html`. The
+placeholder is not decoration: `go:embed` fails the build on a pattern that
+matches nothing, so `dist/` must never be empty. It also renders live
+`topology_status` pushes, which is how the backend was verified end to end
+before any Svelte exists.
+
+### Decisions worth recording
+
+**Adopt-on-start instead of reconcile-on-start.** The store is in-memory, so
+booting with an empty desired state and reconciling would tear down a lab that
+was running perfectly well — a restart of the app would be a restart of the lab.
+`Engine.Adopt` instead seeds the store from actual state when the store is
+untouched. Revisit when persistence lands.
+
+**Cold fields are exactly `type` and `image`.** Everything else is hot and
+applies live via `UpdateNodeConfig`, matching spec §7 ("all four adapters expose
+only hot fields via GUI for v1"). Encoded in one place, `reconcile/diff.go`.
+
+**Recreating a node rebuilds its links, even unchanged ones.** A veth end lives
+inside the node's netns and dies with the container, so a node recreate that
+left its links alone would produce a silently half-wired node. This is the
+subtlest thing in the diff and it has a dedicated test.
+
+**Links are unordered pairs.** A–B and B–A are the same wire. Treating them as
+distinct would tear down and rebuild every link on every cycle.
+
+**Config compares via canonical JSON, not `reflect.DeepEqual`.** Config values
+arrive both from JSON decoding (numbers become `float64`) and from Go literals
+in driver code (`int`). Deep-equal would see a phantom diff on every cycle and
+rewrite config forever.
+
+**Verify by re-reading after apply.** Each cycle re-reads actual state and
+re-diffs rather than assuming its ops took. That catches an op which reported
+success without changing anything, and it's what distinguishes a real failure
+from drift.
+
+**Version doubles as an optimistic-concurrency check.** `PUT /api/topology` with
+a non-zero `version` that doesn't match current returns 409 rather than
+clobbering a change the client never saw. Send `version: 0` to skip the check.
+Identical writes don't bump the version, so a chatty frontend can't cause a
+reconcile storm.
+
+**`owner` is threaded everywhere now**, always `topology.DefaultOwner` in v1.
+Zero cost today; expensive to retrofit later (spec §8).
+
+### Dependencies
+
+- `github.com/coder/websocket` **v1.8.13** (only direct dependency).
+
+Two notes. Spec §3 names `nhooyr.io/websocket`; that module was handed to Coder
+and now lives at `github.com/coder/websocket` — same library and API, still
+maintained, so the new path is used. And it's pinned to v1.8.13 rather than
+latest because v1.8.14+ requires Go 1.23, which isn't installed. Unpin after the
+Go upgrade.
+
+### Toolchain problems found
+
+**Go 1.21.6 can't produce runnable binaries on this macOS.** Its external linker
+omits the `LC_UUID` load command and macOS 15+ refuses to load the result
+(`dyld: missing LC_UUID load command`). Anything importing `net/http` picks up
+the cgo resolver and hits it — the package builds, then won't run.
+
+`CGO_ENABLED=0` avoids it entirely and is the correct setting regardless, since
+spec §2 wants a single static binary and nothing in the dependency tree needs
+cgo. The Makefile sets it. One real consequence: **`go test -race` can't run on
+`internal/httpapi`**, because race requires cgo. Every other package passes
+under `-race`.
+
+**Step 4 is blocked on a Go upgrade.** The podman v5 bindings need Go ≥1.23.
+Upgrade the dev machine and the VM together, bump the `go` directive, and unpin
+the websocket dependency; that also retires the `LC_UUID` workaround.
+
+### Verified
+
+- `make check` passes: `go vet` clean, `gofmt` clean, all tests green.
+- All packages except `internal/httpapi` also pass under `-race` (see above).
+- Server run end to end against the fake driver: `PUT` a 2-host + 1-link
+  topology → reconcile applied `CreateNode h1`, `CreateNode h2`, `CreateLink l1`
+  in phase order → status reported all three `up` at version 1.
+- Removing a node and link produced `DestroyLink l1`, `DestroyNode h2`,
+  `UpdateNodeConfig h1` — destroy-links-before-nodes and config-last, as spec
+  §5.3 requires.
+- Invalid topology returned 422 with per-field details
+  (`nodes[0].type`, `nodes[0].image`).
+- WebSocket delivered the state snapshot on connect and pushed an update on the
+  next change.
+- SPA fallback serves the shell for unknown paths; `/ws/terminal` returns 501.
+
+### Not done
+
+Build order steps 4–11: podman adapter, netlink adapter, router/switch/edge
+adapters, traffic-stats polling, the Svelte frontend, node detail panel,
+terminal, and the visual polish pass. Steps 4–6 cannot be developed or tested on
+macOS and need the Ubuntu VM with a podman socket.
+
+### Placeholder to change
+
+The Go module path is `github.com/bitcrafttech/hivenet`, guessed from the git
+config. If the repo lands elsewhere, change it in `go.mod` and update imports.

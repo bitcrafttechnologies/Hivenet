@@ -1,0 +1,132 @@
+<!doctype html>
+<!--
+  Placeholder shell. Exists so go:embed has something to embed before the Svelte
+  app lands (build order step 8), and so the backend can be verified end to end
+  today: it renders live topology_status pushes off the same WebSocket the real
+  canvas will use. `npm run build` replaces this file.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hivenet</title>
+    <style>
+      :root {
+        --bg: #f8f7f7;
+        --card: #ffffff;
+        --ink: #1a1a1a;
+        --muted: #6b6b6b;
+        --line: #e8e6e6;
+        --up: #16a34a;
+        --error: #dc2626;
+        --pending: #d97706;
+        --applying: #2563eb;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 2.5rem 1.5rem;
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+      }
+      main { max-width: 46rem; margin: 0 auto; }
+      h1 { font-size: 1.25rem; margin: 0 0 .25rem; letter-spacing: -0.01em; }
+      p.sub { margin: 0 0 1.5rem; color: var(--muted); }
+      .card {
+        background: var(--card);
+        border-radius: 14px;
+        box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px rgba(0,0,0,.04);
+        padding: 1.25rem 1.35rem;
+        margin-bottom: 1rem;
+      }
+      .card h2 {
+        font-size: .75rem; text-transform: uppercase; letter-spacing: .06em;
+        color: var(--muted); margin: 0 0 .85rem; font-weight: 600;
+      }
+      .row {
+        display: flex; align-items: center; gap: .6rem;
+        padding: .45rem 0; border-top: 1px solid var(--line);
+      }
+      .row:first-of-type { border-top: 0; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+      .dot.up { background: var(--up); }
+      .dot.error { background: var(--error); }
+      .dot.pending { background: var(--pending); }
+      .dot.applying { background: var(--applying); }
+      .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .msg { color: var(--muted); margin-left: auto; text-align: right; font-size: .8rem; }
+      .empty { color: var(--muted); }
+      code { background: #f0efef; padding: .1rem .35rem; border-radius: 5px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Hivenet</h1>
+      <p class="sub">
+        Backend is running. This is the placeholder shell — the Svelte canvas
+        arrives in build order step 8.
+      </p>
+
+      <div class="card">
+        <h2>Connection</h2>
+        <div class="row"><span class="dot" id="wsdot"></span><span id="wsstate">connecting…</span>
+          <span class="msg">version <span id="version">–</span></span></div>
+      </div>
+
+      <div class="card">
+        <h2>Nodes</h2>
+        <div id="nodes"><div class="empty">No nodes. PUT a topology to <code>/api/topology</code>.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Links</h2>
+        <div id="links"><div class="empty">No links.</div></div>
+      </div>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      function render(target, entities, emptyText) {
+        const ids = Object.keys(entities || {}).sort();
+        if (!ids.length) {
+          target.innerHTML = `<div class="empty">${emptyText}</div>`;
+          return;
+        }
+        target.innerHTML = ids.map((id) => {
+          const e = entities[id];
+          const msg = e.drift ? `${e.message || "drift"}` : (e.message || "");
+          return `<div class="row">
+            <span class="dot ${e.state}"></span>
+            <span class="id">${id}</span>
+            <span class="msg">${e.state}${msg ? " · " + msg : ""}</span>
+          </div>`;
+        }).join("");
+      }
+
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+        ws.onopen = () => {
+          $("wsdot").className = "dot up";
+          $("wsstate").textContent = "connected";
+        };
+        ws.onmessage = (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type !== "topology_status") return;
+          $("version").textContent = msg.data.version;
+          render($("nodes"), msg.data.nodes, "No nodes. PUT a topology to <code>/api/topology</code>.");
+          render($("links"), msg.data.links, "No links.");
+        };
+        ws.onclose = () => {
+          $("wsdot").className = "dot error";
+          $("wsstate").textContent = "disconnected — retrying";
+          setTimeout(connect, 1500);
+        };
+      }
+      connect();
+    </script>
+  </body>
+</html>

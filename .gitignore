@@ -1,0 +1,9 @@
+bin/
+node_modules/
+
+# The built frontend is a build artifact, but web/dist must never be empty or
+# go:embed fails the build — so the placeholder index.html stays tracked and
+# only real build output is ignored.
+web/dist/assets/
+web/dist/*.js
+web/dist/*.css
