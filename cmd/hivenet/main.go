@@ -38,7 +38,7 @@ func main() {
 	}
 }
 
-func `run`(addr string, debounce time.Duration, logger *slog.Logger) error {
+func run(addr string, debounce time.Duration, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

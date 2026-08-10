@@ -6,6 +6,58 @@ that's the part a diff can't recover later.
 
 ---
 
+## 2026-08-10 -- Podman adapter: build order step 4
+
+Go was upgraded from not-installed to 1.22.2 via apt, then to 1.26.5 via
+snap once go.mod needed 1.23+ for the podman v5 bindings (CLAUDE.md,
+"Toolchain"). The `go` directive in go.mod is now 1.25.0 (bumped
+automatically by `go get` when it resolved podman/v5's own requirement).
+`github.com/coder/websocket` was unpinned from v1.8.13 to v1.8.15 per the
+same note.
+
+### Fixed
+
+**`cmd/hivenet/main.go`** -- `run` was declared with its name wrapped in
+backticks, a syntax error that failed every build. Fixed to a plain
+`func run(...)`.
+
+### Added
+
+**`internal/driver/podman`** -- the real `driver.Driver` implementation for
+host nodes (spec section 11 item 4): `CreateNode`/`DestroyNode` launch and
+remove a podman container with `--network=none` (spec section 6). The full
+`topology.Node` is JSON-encoded onto a `hivenet.node` label so `ReadActual`
+can reconstruct it with no in-memory cache -- verified end to end on this
+VM by creating a node, killing the hivenet process, and restarting it: the
+log showed "adopted running topology nodes=1" and the container's uptime
+was untouched, i.e. it was not recreated. `CreateLink`/`DestroyLink` return
+a clear "not implemented yet" error until netlink lands in step 5; only
+`topology.TypeHost` is accepted for now (step 6 covers switch/router/edge).
+
+**`cmd/hivenet/driver_linux.go`** -- now wires `podman.New` instead of the
+fake driver on Linux; `driverName` updated to say so.
+
+### Changed
+
+**`Makefile`** -- added `GOTAGS := containers_image_openpgp` and applied
+`-tags $(GOTAGS)` to build/run/test/vet. Without it, linking
+`containers/podman/v5` pulls in go.podman.io/image's GPGME-based signature
+checker (`github.com/proglottis/gpgme`), which needs cgo; with
+CGO_ENABLED=0 that package has zero buildable files and the link fails
+outright. The tag switches go.podman.io/image to its pure-Go OpenPGP
+mechanism instead, which is upstream's own escape hatch for this exact
+situation.
+
+### Verified on the VM
+
+Installed `golang-go` (1.22.2) via apt, then `go` (1.26.5) via snap,
+symlinking `/usr/local/bin/go` to the snap binary so it wins on PATH.
+podman 4.9.3 with an active podman.socket was already present. `make
+build`, `make check` (vet + test) and `make run` all pass. Manually drove
+the HTTP API (`PUT /api/topology`) to create and destroy a host node and
+confirmed with `podman ps` that a real container came up and was torn
+down, plus the crash-recovery check described above.
+
 ## 2026-08-07 — Project scaffold: build order steps 1–3
 
 First code in the repo. Covers steps 1, 2 and 3 of spec §11; the topology model,
