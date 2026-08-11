@@ -42,6 +42,18 @@ type Engine struct {
 	status  Status
 	subs    map[int]chan Status
 	nextSub int
+
+	// trafficSubs/nextTrafficSub mirror subs/nextSub, but fan out
+	// TrafficDelta batches instead of a Status (traffic.go). Kept
+	// separate so a slow traffic consumer dropping frames never touches
+	// the topology_status channel, and vice versa.
+	trafficSubs    map[int]chan []TrafficDelta
+	nextTrafficSub int
+
+	// trafficBaseline is the last raw counter reading seen per link. It
+	// is read and written only from the Run goroutine's poll ticks, so
+	// unlike status/subs it needs no lock of its own.
+	trafficBaseline map[string]driver.LinkCounters
 }
 
 // Options configures an Engine. Driver and Store are required.
@@ -65,14 +77,16 @@ func NewEngine(opts Options) *Engine {
 		opts.Logger = slog.Default()
 	}
 	e := &Engine{
-		drv:      opts.Driver,
-		store:    opts.Store,
-		owner:    opts.Owner,
-		debounce: opts.Debounce,
-		log:      opts.Logger,
-		trigger:  make(chan struct{}, 1),
-		status:   newStatus(0),
-		subs:     make(map[int]chan Status),
+		drv:             opts.Driver,
+		store:           opts.Store,
+		owner:           opts.Owner,
+		debounce:        opts.Debounce,
+		log:             opts.Logger,
+		trigger:         make(chan struct{}, 1),
+		status:          newStatus(0),
+		subs:            make(map[int]chan Status),
+		trafficSubs:     make(map[int]chan []TrafficDelta),
+		trafficBaseline: make(map[string]driver.LinkCounters),
 	}
 	e.changes, e.unsubscribe = opts.Store.Subscribe()
 	return e
@@ -90,6 +104,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		<-timer.C
 	}
 	armed := false
+
+	trafficTicker := time.NewTicker(TrafficInterval)
+	defer trafficTicker.Stop()
 
 	arm := func() {
 		if armed && !timer.Stop() {
@@ -113,6 +130,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-timer.C:
 			armed = false
 			e.ReconcileNow(ctx)
+		case <-trafficTicker.C:
+			e.pollTraffic(ctx)
 		}
 	}
 }

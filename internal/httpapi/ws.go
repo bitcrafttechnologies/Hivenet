@@ -50,6 +50,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	updates, unsubscribe := s.engine.Subscribe()
 	defer unsubscribe()
 
+	// A laggy or absent frontend must not block the topology_status
+	// case above (or vice versa): traffic gets its own subscription and
+	// select case rather than being folded into one channel.
+	trafficUpdates, unsubscribeTraffic := s.engine.SubscribeTraffic()
+	defer unsubscribeTraffic()
+
 	// The client sends nothing on this socket. Reading anyway is how a
 	// disconnect is noticed promptly, and it keeps control frames drained.
 	go func() {
@@ -77,6 +83,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := writeMessage(ctx, conn, msgTopologyStatus, status); err != nil {
+				s.log.Debug("websocket write failed, dropping client", "error", err)
+				return
+			}
+		case samples, ok := <-trafficUpdates:
+			if !ok {
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+				return
+			}
+			if err := writeMessage(ctx, conn, msgTrafficStats, samples); err != nil {
 				s.log.Debug("websocket write failed, dropping client", "error", err)
 				return
 			}

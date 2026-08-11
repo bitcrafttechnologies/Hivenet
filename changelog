@@ -1,3 +1,63 @@
+## 2026-08-11 -- Traffic-stats polling + `traffic_stats` push: build order step 7
+
+The reconciler now samples real kernel byte counters off every up link once a
+second and pushes the deltas over the same topology WebSocket the frontend
+will use for the moving-dot animation. Validated on the VM: a two-host link
+carrying a `ping` flood produced matching forward and reverse deltas on the
+`/ws` connection at roughly 1Hz, alongside the existing `topology_status`
+pushes, with the flood's own packet loss at 0% throughout.
+
+### Added
+
+**`internal/driver/driver.go`** -- new `LinkCounters` type (`TxBytes`,
+`RxBytes`, cumulative kernel counters) and a `Driver.LinkCounters(ctx, owner,
+link)` method. It only reads endpoint 0's veth end: a veth pair's two ends
+are one physical wire, so end 0's `TxBytes`/`RxBytes` already carry both
+directions (`TxBytes` out to endpoint 1, `RxBytes` in from endpoint 1) --
+there is no need to open endpoint 1's netns at all.
+
+**`internal/driver/podman/netlink.go`** -- implements `LinkCounters` by
+opening endpoint 0's node netns (the same `openNodeNetns`/`netlink.Handle`
+path `CreateLink`/`UpdateNodeConfig` already use), finding the link's veth
+by its deterministic `driver.VethName`, and reading `Attrs().Statistics`.
+
+**`internal/driver/fake/fake.go`** -- a `counters` map plus `LinkCounters`
+(returns the last value set, or an injected failure) and `SetLinkCounters`,
+so reconciler tests can drive synthetic traffic between poll ticks without
+touching real kernel state.
+
+**`internal/reconcile/traffic.go`** -- the poller itself. `TrafficDelta`
+(`linkId`, `direction` -- `fwd` for `Endpoints[0]->[1]`, `rev` for the
+reverse -- `bytesDelta`) is the wire payload. `Engine.pollTraffic` walks
+every link the last reconcile cycle reported `up`, reads its counters,
+diffs against a per-link baseline kept on the `Run` goroutine (no lock
+needed -- only that goroutine ever touches it, same as every other
+podman/netlink call), and publishes non-zero deltas as one batch via a new
+`Engine.SubscribeTraffic`. A link's first sighting only establishes a
+baseline (never a delta -- there is nothing to diff yet, and diffing against
+zero would report a link's entire lifetime traffic as one spike). A link
+that disappears from the desired topology has its baseline dropped, so a
+reused ID does not read as a huge negative delta against a stale reading. A
+counter that goes backwards (interface recreated between polls) is treated
+as a fresh baseline rather than underflowing. `Engine.Run` gained a second
+ticker (`TrafficInterval`, 1s) alongside the existing debounce timer.
+
+### Changed
+
+**`internal/httpapi/ws.go`** -- `handleWS` now also subscribes via
+`SubscribeTraffic` and pushes `msgTrafficStats` frames from a second
+`select` case. Traffic and status are deliberately two separate
+subscriptions (as the doc comment already called for) so a slow consumer
+dropping frames on one never affects the other.
+
+**`CLAUDE.md`** -- checked off build order step 7.
+
+### Deferred
+
+Frontend consumption of `traffic_stats` (the moving-dot animation itself)
+is step 8's Svelte work, not this one. This step only had to prove the
+backend samples and pushes real deltas, which the VM ping-flood test above
+confirms.
 ## 2026-08-11 -- Extend adapters to router/switch/edge: build order step 6
 
 All four v1 node types (host, switch, router, edge) are now real containers

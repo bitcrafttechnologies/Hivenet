@@ -66,8 +66,23 @@ type Driver interface {
 	// DestroyLink removes the veth pair. Deleting either end removes both.
 	DestroyLink(ctx context.Context, owner, linkID string) error
 
+	// LinkCounters reports the ever-increasing kernel byte counters observed
+	// at endpoint 0's veth end of a link's pair. Because both ends of a veth
+	// are the same physical wire, this single reading carries both
+	// directions: TxBytes is endpoint0->endpoint1 traffic, and RxBytes is
+	// the reverse, endpoint1->endpoint0 (spec section 11 step 7). Callers diff
+	// successive readings themselves; this is a raw counter, not a delta.
+	LinkCounters(ctx context.Context, owner string, link topology.Link) (LinkCounters, error)
+
 	// Close releases any long-lived connection the driver holds.
 	Close() error
+}
+
+// LinkCounters is one endpoint's raw view of a link's traffic, as read by
+// Driver.LinkCounters. Values are cumulative kernel counters, not deltas.
+type LinkCounters struct {
+	TxBytes uint64
+	RxBytes uint64
 }
 
 // VethName derives the host-visible name for one end of a link's veth pair.

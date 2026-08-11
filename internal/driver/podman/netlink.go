@@ -253,6 +253,38 @@ func (d *Driver) DestroyLink(ctx context.Context, owner, linkID string) error {
 	return nil // already gone: matches the idempotency contract in driver.Driver
 }
 
+// LinkCounters reads the raw byte counters off endpoint 0's veth end,
+// inside that node's netns, for the traffic poller (HIVENET_MVP_SPEC.md
+// section 11 step 7). It does not touch endpoint 1: a veth pair's two ends
+// are one physical wire, so end 0's TxBytes/RxBytes already carry both
+// directions (TxBytes out to endpoint 1, RxBytes in from endpoint 1).
+func (d *Driver) LinkCounters(ctx context.Context, owner string, link topology.Link) (driver.LinkCounters, error) {
+	ep0 := link.Endpoints[0]
+	name0 := driver.VethName(link.ID, 0)
+
+	ns0, err := openNodeNetns(ep0.NodeID)
+	if err != nil {
+		return driver.LinkCounters{}, fmt.Errorf("link counters %s: %w", link.ID, err)
+	}
+	defer closeNs(ns0)
+
+	h0, err := netlink.NewHandleAt(ns0)
+	if err != nil {
+		return driver.LinkCounters{}, fmt.Errorf("link counters %s: netlink handle for node %s: %w", link.ID, ep0.NodeID, err)
+	}
+	defer h0.Close()
+
+	lk, err := h0.LinkByName(name0)
+	if err != nil {
+		return driver.LinkCounters{}, fmt.Errorf("link counters %s: find %s in node %s netns: %w", link.ID, name0, ep0.NodeID, err)
+	}
+	stats := lk.Attrs().Statistics
+	if stats == nil {
+		return driver.LinkCounters{}, fmt.Errorf("link counters %s: %s reported no statistics", link.ID, name0)
+	}
+	return driver.LinkCounters{TxBytes: stats.TxBytes, RxBytes: stats.RxBytes}, nil
+}
+
 // readNetnsLinksBestEffort decodes every link alias found in a node's
 // netns back into a topology.Link. It is the link half of ReadActual:
 // podman's container list has no notion of the veth pairs wired between

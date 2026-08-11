@@ -196,7 +196,7 @@ sessions / RBAC, Terraform for per-node provisioning, AI prompt bar in the UI.
 4. ✅ Podman adapter: `CreateNode`/`DestroyNode` for host nodes (Linux only)
 5. ✅ Netlink adapter: veth pairs + netns move + symlinks; two hosts ping
 6. ✅ Extend adapters to router/switch/edge
-7. ⬜ Traffic-stats polling + `traffic_stats` push
+7. ✅ Traffic-stats polling + `traffic_stats` push
 8. ⬜ Svelte frontend: canvas, palette, outline panel
 9. ⬜ Node detail panel: per-type config, field-level save, lock-on-pending
 10. ⬜ Terminal tab: pty WebSocket + xterm.js

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/bitcrafttech/hivenet/internal/driver"
 	"github.com/bitcrafttech/hivenet/internal/topology"
 )
 
@@ -24,6 +25,11 @@ type Driver struct {
 	mu    sync.Mutex
 	nodes map[string]nodeRecord
 	links map[string]linkRecord
+
+	// counters is the last byte-counter reading set for a link by
+	// SetLinkCounters, returned verbatim by LinkCounters. Tests drive
+	// synthetic traffic by calling SetLinkCounters between poll ticks.
+	counters map[string]driver.LinkCounters
 
 	// failures maps "<op>:<id>" to the error that op should return, letting
 	// tests exercise the no-rollback partial-failure path (spec §5.5).
@@ -48,6 +54,7 @@ func New() *Driver {
 	return &Driver{
 		nodes:    make(map[string]nodeRecord),
 		links:    make(map[string]linkRecord),
+		counters: make(map[string]driver.LinkCounters),
 		failures: make(map[string]error),
 	}
 }
@@ -165,6 +172,26 @@ func (d *Driver) DestroyLink(ctx context.Context, owner, linkID string) error {
 	}
 	delete(d.links, linkID)
 	return nil
+}
+
+// LinkCounters returns the counters last set for linkID via
+// SetLinkCounters (zero value if never set), simulating
+// driver.Driver.LinkCounters without any real kernel state.
+func (d *Driver) LinkCounters(ctx context.Context, owner string, link topology.Link) (driver.LinkCounters, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.failures["LinkCounters:"+link.ID]; err != nil {
+		return driver.LinkCounters{}, err
+	}
+	return d.counters[link.ID], nil
+}
+
+// SetLinkCounters lets a test advance a link's simulated byte counters,
+// standing in for real traffic crossing its veth pair between poll ticks.
+func (d *Driver) SetLinkCounters(linkID string, c driver.LinkCounters) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.counters[linkID] = c
 }
 
 // Close is a no-op.
