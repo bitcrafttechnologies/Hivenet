@@ -1,3 +1,70 @@
+## 2026-08-11 -- Extend adapters to router/switch/edge: build order step 6
+
+All four v1 node types (host, switch, router, edge) are now real containers
+with real networking, not just schema entries. Manually validated end to end
+on the VM: a switch-bridged pair pings at ttl=64 (proper L2, no routing), and
+two hosts on different subnets ping through a router at ttl=63 with a static
+route installed (`ip route` showed the connected routes plus the configured
+192.0.2.0/24 route, `ip_forward` read back as `1`). Edge nodes create and
+link like any other node; NAT/iptables for edge is explicitly not done yet
+(see Deferred below), matching how OSPF/BGP and Open vSwitch are already
+called out as terminal-tab/v2 work rather than silently missing pieces.
+
+### Fixed
+
+**`internal/driver/podman/netlink.go`** -- `UpdateNodeConfig` applied
+node-level config (`ipForward`, `routes`) *before* the per-interface IP loop.
+A route with only a gateway (no explicit link index) needs the kernel to
+already have a connected route to that gateway, which only exists once the
+interface's address is assigned -- so the very first router test failed with
+"network is unreachable" even though the interface config that would have
+fixed it was sitting a few lines further down, never reached because the
+route application returned an error first. Reordered so interface addresses
+land before `ipForward`/`routes`. Caught by manually standing up a
+host-router-host topology on the VM and reading back `ip route` inside the
+router's netns instead of trusting the reconciler's own "up" status.
+
+### Added
+
+**`internal/driver/podman/netlink.go`** -- `ensureBridgeMember` attaches a
+switch node's veth ends to a per-netns kernel bridge (`hvbr0`), created
+lazily the first time a switch node gets a link; called from `CreateLink`
+whenever an endpoint's node type is `switch`. This is structural, not a hot
+field: the spec treats switch behavior as "Linux bridge, kernel-native" with
+no GUI-configurable fields in v1, so there is nothing for `UpdateNodeConfig`
+to do for switches. `setIPForward` flips `net.ipv4.ip_forward` inside a
+node's netns by joining it on a locked OS thread (the sysctl lives under
+`/proc`, not rtnetlink, so this can't go through the same handle-based calls
+as everything else). `UpdateNodeConfig` gained handling for `node.Config`'s
+`ipForward` (bool) and `routes` (list of `{dest, via}` CIDR/IP pairs, applied
+via `RouteReplace`) -- the router's two hot fields per spec section 7.
+
+### Changed
+
+**`internal/driver/podman/podman.go`** -- `CreateNode` no longer rejects
+non-host node types. It was already fully generic (image, labels, sleep
+infinity, no network at create time); the only thing gating it to hosts was
+an explicit early return left over from build order step 4. Removed the
+gate and rewrote the doc comment to say plainly that all four v1 types are
+identical plain containers at this layer, and that type-specific behavior
+lives entirely in `CreateLink` (switch bridging) and `UpdateNodeConfig`
+(router's `ipForward`/`routes`).
+
+**`cmd/hivenet/driver_linux.go`** -- updated `driverName` and the doc
+comment above `newDriver` to say "steps 4-6" instead of "steps 4-5", since
+this file's whole point is to be the one place that names which build order
+steps the active driver actually covers.
+
+### Deferred
+
+Edge nodes get NAT/masquerading and a default route out in the spec (section
+7), but that needs either shelling into the container or an nftables/iptables
+Go library, both a meaningfully bigger and riskier change than the rest of
+this step. Left undone for now rather than rushed in; an edge node today is
+just a plain container with whatever interfaces and IPs you give it, same as
+a host.
+
+
 # Hivenet changelog
 
 Every change to code, schema, dependencies or build process gets an entry here,

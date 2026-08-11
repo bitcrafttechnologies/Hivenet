@@ -10,6 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"os"
+	"runtime"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -58,6 +61,15 @@ func closeNs(ns netns.NsHandle) {
 func (d *Driver) CreateLink(ctx context.Context, owner string, link topology.Link) error {
 	ep0, ep1 := link.Endpoints[0], link.Endpoints[1]
 	name0, name1 := driver.VethName(link.ID, 0), driver.VethName(link.ID, 1)
+
+	ownerNodes, err := d.listOwnerNodes(owner)
+	if err != nil {
+		return fmt.Errorf("create link %s: %w", link.ID, err)
+	}
+	typeOf := make(map[string]topology.NodeType, len(ownerNodes))
+	for _, n := range ownerNodes {
+		typeOf[n.ID] = n.Type
+	}
 
 	ns0, err := openNodeNetns(ep0.NodeID)
 	if err != nil {
@@ -133,6 +145,11 @@ func (d *Driver) CreateLink(ctx context.Context, owner string, link topology.Lin
 	if err := h0.LinkSetUp(movedEnd0); err != nil {
 		return fmt.Errorf("create link %s: bring %s up: %w", link.ID, name0, err)
 	}
+	if typeOf[ep0.NodeID] == topology.TypeSwitch {
+		if err := ensureBridgeMember(h0, name0); err != nil {
+			return fmt.Errorf("create link %s: %w", link.ID, err)
+		}
+	}
 
 	movedEnd1, err := h1.LinkByName(name1)
 	if err != nil {
@@ -143,6 +160,48 @@ func (d *Driver) CreateLink(ctx context.Context, owner string, link topology.Lin
 	}
 	if err := h1.LinkSetUp(movedEnd1); err != nil {
 		return fmt.Errorf("create link %s: bring %s up: %w", link.ID, name1, err)
+	}
+	if typeOf[ep1.NodeID] == topology.TypeSwitch {
+		if err := ensureBridgeMember(h1, name1); err != nil {
+			return fmt.Errorf("create link %s: %w", link.ID, err)
+		}
+	}
+	return nil
+}
+
+// ensureBridgeMember makes vethName a port of the switch's kernel bridge
+// inside the namespace h is bound to, creating the bridge first if this
+// is the switch's first port (spec section 7: switch nodes are "Linux
+// bridge, kernel-native"). Idempotent: re-attaching an already-attached
+// port, or bringing up an already-up bridge, is a no-op in the kernel.
+func ensureBridgeMember(h *netlink.Handle, vethName string) error {
+	const switchBridgeName = "hvbr0"
+
+	br, err := h.LinkByName(switchBridgeName)
+	if err != nil {
+		if _, notFound := err.(netlink.LinkNotFoundError); !notFound {
+			return fmt.Errorf("find switch bridge: %w", err)
+		}
+		attrs := netlink.NewLinkAttrs()
+		attrs.Name = switchBridgeName
+		if err := h.LinkAdd(&netlink.Bridge{LinkAttrs: attrs}); err != nil {
+			return fmt.Errorf("create switch bridge: %w", err)
+		}
+		br, err = h.LinkByName(switchBridgeName)
+		if err != nil {
+			return fmt.Errorf("find switch bridge after create: %w", err)
+		}
+	}
+	if err := h.LinkSetUp(br); err != nil {
+		return fmt.Errorf("bring up switch bridge: %w", err)
+	}
+
+	veth, err := h.LinkByName(vethName)
+	if err != nil {
+		return fmt.Errorf("find port %s: %w", vethName, err)
+	}
+	if err := h.LinkSetMaster(veth, br); err != nil {
+		return fmt.Errorf("attach port %s to switch bridge: %w", vethName, err)
 	}
 	return nil
 }
@@ -235,13 +294,48 @@ func readNetnsLinksBestEffort(nodeID string) []topology.Link {
 	return out
 }
 
-// UpdateNodeConfig applies hot config fields (driver.Driver). For host
-// nodes in v1 the only hot field is per-interface IP/CIDR (spec section
-// 7). It is applied here, keyed off each interface's veth alias, rather
-// than in CreateLink, because CreateLink only ever sees link geometry
-// (topology.Link), never a node's interface Config.
+// setIPForward toggles kernel IPv4 forwarding inside ns. Forwarding is a
+// /proc/sys file, not something rtnetlink exposes, so applying it means
+// actually joining the namespace on the calling OS thread rather than
+// just binding a netlink socket to it as netlink.NewHandleAt does. The
+// thread is locked and its original namespace restored before returning,
+// so this cannot leak into other goroutines' netlink calls.
+func setIPForward(ns netns.NsHandle, enabled bool) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	origin, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("get current netns: %w", err)
+	}
+	defer origin.Close()
+
+	if err := netns.Set(ns); err != nil {
+		return fmt.Errorf("enter netns: %w", err)
+	}
+	defer netns.Set(origin)
+
+	val := []byte("0\n")
+	if enabled {
+		val = []byte("1\n")
+	}
+	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", val, 0o644); err != nil {
+		return fmt.Errorf("write ip_forward: %w", err)
+	}
+	return nil
+}
+
+// UpdateNodeConfig applies hot config fields (driver.Driver). Two shapes
+// of config exist: per-interface (spec section 7's "IP/CIDR per
+// interface"), keyed off each interface's veth alias since CreateLink
+// only ever sees link geometry (topology.Link), never a node's interface
+// Config; and per-node (build order step 6's router/edge additions --
+// "ipForward" turns on kernel forwarding, "routes" installs a static
+// routes table). Switch nodes have no hot fields here: their only
+// configurable behavior, bridge membership, is structural and lives in
+// CreateLink instead.
 func (d *Driver) UpdateNodeConfig(ctx context.Context, node topology.Node) error {
-	if len(node.Interfaces) == 0 {
+	if len(node.Interfaces) == 0 && len(node.Config) == 0 {
 		return nil
 	}
 
@@ -304,5 +398,41 @@ func (d *Driver) UpdateNodeConfig(ctx context.Context, node topology.Node) error
 			return fmt.Errorf("update node %s config: interface %s: apply %s: %w", node.ID, ifaceID, cidr, err)
 		}
 	}
+	if raw, ok := node.Config["ipForward"]; ok {
+		enabled, _ := raw.(bool)
+		if err := setIPForward(ns, enabled); err != nil {
+			return fmt.Errorf("update node %s config: %w", node.ID, err)
+		}
+	}
+
+	if raw, ok := node.Config["routes"]; ok {
+		routes, ok := raw.([]any)
+		if !ok {
+			return fmt.Errorf("update node %s config: routes must be a list", node.ID)
+		}
+		for i, r := range routes {
+			rm, ok := r.(map[string]any)
+			if !ok {
+				return fmt.Errorf("update node %s config: routes[%d] must be an object", node.ID, i)
+			}
+			destStr, _ := rm["dest"].(string)
+			viaStr, _ := rm["via"].(string)
+			if destStr == "" || viaStr == "" {
+				return fmt.Errorf("update node %s config: routes[%d] needs dest and via", node.ID, i)
+			}
+			_, dest, err := net.ParseCIDR(destStr)
+			if err != nil {
+				return fmt.Errorf("update node %s config: routes[%d] dest %q: %w", node.ID, i, destStr, err)
+			}
+			via := net.ParseIP(viaStr)
+			if via == nil {
+				return fmt.Errorf("update node %s config: routes[%d] via %q is not an IP", node.ID, i, viaStr)
+			}
+			if err := h.RouteReplace(&netlink.Route{Dst: dest, Gw: via}); err != nil {
+				return fmt.Errorf("update node %s config: apply route %s via %s: %w", node.ID, destStr, viaStr, err)
+			}
+		}
+	}
+
 	return nil
 }

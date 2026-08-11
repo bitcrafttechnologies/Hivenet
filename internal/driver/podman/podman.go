@@ -73,13 +73,14 @@ func containerName(owner, nodeID string) string {
 // section 6: "every node container launches with --network=none");
 // connectivity is added later by CreateLink. Creating a node that already
 // exists is a no-op, matching the idempotency contract in driver.Driver.
-// Only host nodes are supported so far (spec section 11 item 4); other
-// types are step 6. On success the node's netns is symlinked under
-// /var/run/netns (spec section 6) so CreateLink can address it later.
+// All four v1 node types (spec section 7: host, switch, router, edge)
+// are plain containers at this layer -- CreateNode never branches on
+// node.Type. The only per-type differences live in CreateLink and
+// UpdateNodeConfig, which decide what to do with a node's interfaces
+// once the container exists (build order step 6). On success the
+// node's netns is symlinked under /var/run/netns (spec section 6) so
+// CreateLink can address it later.
 func (d *Driver) CreateNode(ctx context.Context, node topology.Node) error {
-	if node.Type != topology.TypeHost {
-		return fmt.Errorf("create node %s: node type %q not implemented yet (build order step 6)", node.ID, node.Type)
-	}
 
 	name := containerName(node.Owner, node.ID)
 
