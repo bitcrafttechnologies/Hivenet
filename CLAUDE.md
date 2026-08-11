@@ -193,9 +193,8 @@ sessions / RBAC, Terraform for per-node provisioning, AI prompt bar in the UI.
 1. ✅ Go backend scaffold: HTTP server, `go:embed`, WebSocket endpoints (stubbed)
 2. ✅ Topology doc schema + in-memory store + version counter
 3. ✅ Reconciler core: read-actual → diff → typed ops
-4. ⬜ Podman adapter: `CreateNode`/`DestroyNode` for host nodes (Linux only)
-   — **blocked on the Go upgrade**, see "Toolchain"
-5. ⬜ Netlink adapter: veth pairs + netns move + symlinks; two hosts ping
+4. ✅ Podman adapter: `CreateNode`/`DestroyNode` for host nodes (Linux only)
+5. ✅ Netlink adapter: veth pairs + netns move + symlinks; two hosts ping
 6. ⬜ Extend adapters to router/switch/edge
 7. ⬜ Traffic-stats polling + `traffic_stats` push
 8. ⬜ Svelte frontend: canvas, palette, outline panel
@@ -205,3 +204,7 @@ sessions / RBAC, Terraform for per-node provisioning, AI prompt bar in the UI.
 
 Steps 4–6 require the Ubuntu VM with a podman socket. They cannot be developed or
 tested on the Mac — write them against the driver interface and validate on the VM.
+Steps 4 and 5 are both done: manually validated on this VM by PUTting a two-host,
+one-link topology, confirming real IP config landed on the veth ends, pinging
+between the namespaces, then tearing the link and nodes back down and checking
+podman ps / ip netns are empty again.

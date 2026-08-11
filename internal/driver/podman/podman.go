@@ -1,19 +1,21 @@
 //go:build linux
 
 // Package podman implements the Podman-backed half of driver.Driver: the
-// container lifecycle for host nodes (CreateNode, DestroyNode, ReadActual).
-// This is build order step 4 (CLAUDE.md, "Build order"); link management
-// needs netlink and lands in step 5, so CreateLink/DestroyLink return an
-// error here until then. See HIVENET_MVP_SPEC.md, section 11, item 4:
-// "Podman adapter: CreateNode/DestroyNode for the host node type only,
-// prove the container lifecycle end to end."
+// container lifecycle for host nodes (CreateNode, DestroyNode, ReadActual)
+// plus the netns bookkeeping CreateLink/DestroyLink depend on. Link
+// management itself (veth pairs, netns moves) lives in netlink.go -- this
+// file stays focused on talking to podman. See HIVENET_MVP_SPEC.md section
+// 11, item 4/5: "Podman adapter" and "Netlink adapter".
 package podman
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/containers/podman/v5/pkg/bindings"
@@ -67,12 +69,13 @@ func containerName(owner, nodeID string) string {
 	return "hivenet_" + invalidNameChars.ReplaceAllString(owner+"_"+nodeID, "_")
 }
 
-// CreateNode starts node's container with no network namespace (spec
+// CreateNode starts the node's container with no network namespace (spec
 // section 6: "every node container launches with --network=none");
 // connectivity is added later by CreateLink. Creating a node that already
 // exists is a no-op, matching the idempotency contract in driver.Driver.
 // Only host nodes are supported so far (spec section 11 item 4); other
-// types are step 6.
+// types are step 6. On success the node's netns is symlinked under
+// /var/run/netns (spec section 6) so CreateLink can address it later.
 func (d *Driver) CreateNode(ctx context.Context, node topology.Node) error {
 	if node.Type != topology.TypeHost {
 		return fmt.Errorf("create node %s: node type %q not implemented yet (build order step 6)", node.ID, node.Type)
@@ -115,13 +118,56 @@ func (d *Driver) CreateNode(ctx context.Context, node topology.Node) error {
 	if err := containers.Start(d.ctx, created.ID, nil); err != nil {
 		return fmt.Errorf("create node %s: start: %w", node.ID, err)
 	}
+
+	pid, err := d.containerPID(name)
+	if err != nil {
+		return fmt.Errorf("create node %s: %w", node.ID, err)
+	}
+	if err := ensureNetnsSymlink(node.ID, pid); err != nil {
+		return fmt.Errorf("create node %s: %w", node.ID, err)
+	}
 	return nil
 }
 
-// DestroyNode stops and removes the node's container. Destroying a node
-// that does not exist is a no-op, matching the idempotency contract in
-// driver.Driver. It does not clean up a netns symlink (driver.NetnsPath)
-// yet because nothing creates one until CreateLink lands in step 5.
+// containerPID returns the host-visible PID of a running container, needed
+// to reach its network namespace via /proc/<pid>/ns/net
+// (driver.ProcNetnsPath).
+func (d *Driver) containerPID(name string) (int, error) {
+	data, err := containers.Inspect(d.ctx, name, nil)
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if data.State == nil || data.State.Pid == 0 {
+		return 0, fmt.Errorf("inspect %s: no running pid reported", name)
+	}
+	return data.State.Pid, nil
+}
+
+// ensureNetnsSymlink links a node's netns under /var/run/netns (spec
+// section 6) so that `ip netns`, netns.GetFromPath, and later CreateLink
+// calls can address it by node ID. Podman does not populate this directory
+// itself. Idempotent: a stale symlink left over from a previous container
+// that used this node ID is replaced rather than left dangling.
+func ensureNetnsSymlink(nodeID string, pid int) error {
+	target := driver.NetnsPath(nodeID)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return fmt.Errorf("create netns dir: %w", err)
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale netns symlink: %w", err)
+	}
+	if err := os.Symlink(driver.ProcNetnsPath(pid), target); err != nil {
+		return fmt.Errorf("symlink netns: %w", err)
+	}
+	return nil
+}
+
+// DestroyNode stops and removes the node's container and cleans up its
+// netns symlink. Destroying a node that does not exist is a no-op,
+// matching the idempotency contract in driver.Driver. Removing the symlink
+// is not optional (spec section 6): a leftover entry in /var/run/netns
+// outlives the container and is invisible to ReadActual, which only looks
+// at podman -- so it would leak forever.
 func (d *Driver) DestroyNode(ctx context.Context, owner, nodeID string) error {
 	name := containerName(owner, nodeID)
 
@@ -129,31 +175,32 @@ func (d *Driver) DestroyNode(ctx context.Context, owner, nodeID string) error {
 	if err != nil {
 		return fmt.Errorf("destroy node %s: check existing: %w", nodeID, err)
 	}
-	if !exists {
-		return nil
+	if exists {
+		if _, err := containers.Remove(d.ctx, name, new(containers.RemoveOptions).WithForce(true)); err != nil {
+			return fmt.Errorf("destroy node %s: %w", nodeID, err)
+		}
 	}
 
-	if _, err := containers.Remove(d.ctx, name, new(containers.RemoveOptions).WithForce(true)); err != nil {
-		return fmt.Errorf("destroy node %s: %w", nodeID, err)
+	if err := os.Remove(driver.NetnsPath(nodeID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("destroy node %s: remove netns symlink: %w", nodeID, err)
 	}
 	return nil
 }
 
-// ReadActual lists containers Hivenet manages for owner and decodes each
-// one's nodeLabel back into a topology.Node. The running container's label
-// is the only source of truth; nothing here is cached, so a crash or VM
-// reboot cannot desync it (CLAUDE.md, "Never trust in-memory state as
-// ground truth").
-func (d *Driver) ReadActual(ctx context.Context, owner string) (topology.Topology, error) {
+// listOwnerNodes lists every container Hivenet manages for owner and
+// decodes each one's nodeLabel back into a topology.Node. Nothing here is
+// cached, matching CLAUDE.md's "never trust in-memory state as ground
+// truth".
+func (d *Driver) listOwnerNodes(owner string) ([]topology.Node, error) {
 	filters := map[string][]string{
 		"label": {driver.ManagedLabel, driver.OwnerLabel + "=" + owner},
 	}
 	list, err := containers.List(d.ctx, new(containers.ListOptions).WithAll(true).WithFilters(filters))
 	if err != nil {
-		return topology.Topology{}, fmt.Errorf("read actual state for %s: list containers: %w", owner, err)
+		return nil, fmt.Errorf("list containers: %w", err)
 	}
 
-	var out topology.Topology
+	var out []topology.Node
 	for _, c := range list {
 		encoded, ok := c.Labels[nodeLabel]
 		if !ok {
@@ -161,28 +208,43 @@ func (d *Driver) ReadActual(ctx context.Context, owner string) (topology.Topolog
 		}
 		var node topology.Node
 		if err := json.Unmarshal([]byte(encoded), &node); err != nil {
-			return topology.Topology{}, fmt.Errorf("read actual state for %s: decode %s label on %s: %w", owner, nodeLabel, strings.Join(c.Names, ","), err)
+			return nil, fmt.Errorf("decode %s label on %s: %w", nodeLabel, strings.Join(c.Names, ","), err)
 		}
-		out.Nodes = append(out.Nodes, node)
+		out = append(out, node)
 	}
 	return out, nil
 }
 
-// CreateLink is netlink's job (veth pairs, netns moves) and lands in build
-// order step 5 (CLAUDE.md, "Build order"). It always fails until then.
-func (d *Driver) CreateLink(ctx context.Context, owner string, link topology.Link) error {
-	return fmt.Errorf("create link %s: netlink adapter not implemented yet (build order step 5)", link.ID)
-}
+// ReadActual observes real state for owner and returns it as a topology
+// (driver.Driver). Node state comes from podman; link state comes from the
+// veth aliases netlink.go leaves in each node's netns, since podman has no
+// notion of the veth pairs wired between namespaces. A crash or VM reboot
+// recovers cleanly because nothing here is cached (CLAUDE.md, "Never trust
+// in-memory state as ground truth").
+func (d *Driver) ReadActual(ctx context.Context, owner string) (topology.Topology, error) {
+	nodes, err := d.listOwnerNodes(owner)
+	if err != nil {
+		return topology.Topology{}, fmt.Errorf("read actual state for %s: %w", owner, err)
+	}
 
-// DestroyLink is netlink's job; see CreateLink.
-func (d *Driver) DestroyLink(ctx context.Context, owner, linkID string) error {
-	return fmt.Errorf("destroy link %s: netlink adapter not implemented yet (build order step 5)", linkID)
-}
+	links := make(map[string]topology.Link)
+	for _, node := range nodes {
+		// A node with no links yet has no netns symlink to a namespace
+		// that's had any veth moved into it if CreateLink never ran, or the
+		// symlink may be mid-teardown; either way that's not an error here,
+		// it just means this node currently contributes no links.
+		for _, l := range readNetnsLinksBestEffort(node.ID) {
+			links[l.ID] = l
+		}
+	}
 
-// UpdateNodeConfig applies hot config fields. Host nodes declare no hot
-// fields yet, so there is nothing to apply.
-func (d *Driver) UpdateNodeConfig(ctx context.Context, node topology.Node) error {
-	return nil
+	out := topology.Topology{Nodes: nodes}
+	for _, l := range links {
+		out.Links = append(out.Links, l)
+	}
+	sort.Slice(out.Nodes, func(i, j int) bool { return out.Nodes[i].ID < out.Nodes[j].ID })
+	sort.Slice(out.Links, func(i, j int) bool { return out.Links[i].ID < out.Links[j].ID })
+	return out, nil
 }
 
 // Close releases the podman connection's idle HTTP connections.

@@ -31,6 +31,15 @@ func Diff(desired, actual topology.Topology) []Op {
 		a, exists := actualNodes[id]
 		if !exists {
 			ops = append(ops, Op{Kind: OpCreateNode, NodeID: id, Reason: "node is not running"})
+			// The container was just created with no network config at all, so any
+			// hot config the desired node already carries still needs to be applied.
+			// hotChange isn't the right test here: it also flags structural interface
+			// declarations (which CreateLink, not this, is responsible for), so a bare
+			// interface with no Config would wrongly look like a change against a
+			// zero-value Node.
+			if needsConfigApply(d) {
+				ops = append(ops, Op{Kind: OpUpdateNodeConfig, NodeID: id, Reason: "initial config for a new container"})
+			}
 			continue
 		}
 		if reason := coldChange(d, a); reason != "" {
@@ -39,6 +48,12 @@ func Diff(desired, actual topology.Topology) []Op {
 				Op{Kind: OpDestroyNode, NodeID: id, Reason: reason},
 				Op{Kind: OpCreateNode, NodeID: id, Reason: reason},
 			)
+			// Same reasoning as the not-running case above: the node behind id was
+			// just torn down and rebuilt from scratch, so it holds none of its old
+			// hot config either.
+			if needsConfigApply(d) {
+				ops = append(ops, Op{Kind: OpUpdateNodeConfig, NodeID: id, Reason: "initial config for a recreated container"})
+			}
 			continue
 		}
 		if reason := hotChange(d, a); reason != "" {
@@ -102,6 +117,25 @@ func coldChange(desired, actual topology.Node) string {
 	default:
 		return ""
 	}
+}
+
+// needsConfigApply reports whether a freshly created (or just recreated) node
+// carries any hot config that its CreateNode call never applied -- CreateNode
+// only ever sees link geometry (topology.Link), never a node's interface
+// Config, so declaring an interface with no Config on it is not by itself a
+// reason to schedule an update (see hotChange, which -- unlike this -- also
+// flags structural interface differences and is only meaningful once a node
+// actually exists to compare against).
+func needsConfigApply(n topology.Node) bool {
+	if len(n.Config) > 0 {
+		return true
+	}
+	for _, iface := range n.Interfaces {
+		if len(iface.Config) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // hotChange reports the reason a node needs a live config update, or "" if it

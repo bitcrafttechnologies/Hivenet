@@ -65,6 +65,11 @@ func TestDiff(t *testing.T) {
 			want:    []string{"CreateNode:h1"},
 		},
 		{
+			name:    "new node with day-one hot config gets it applied, not just created bare",
+			desired: topology.Topology{Nodes: []topology.Node{node("h1", withConfig(topology.Config{"hostname": "web"}))}},
+			want:    []string{"CreateNode:h1", "UpdateNodeConfig:h1"},
+		},
+		{
 			name:   "node no longer wanted",
 			actual: topology.Topology{Nodes: []topology.Node{node("h1")}},
 			want:   []string{"DestroyNode:h1"},
@@ -80,6 +85,12 @@ func TestDiff(t *testing.T) {
 			desired: topology.Topology{Nodes: []topology.Node{node("h1", withImage("debian"))}},
 			actual:  topology.Topology{Nodes: []topology.Node{node("h1")}},
 			want:    []string{"DestroyNode:h1", "CreateNode:h1"},
+		},
+		{
+			name:    "recreated node carries its hot config over, not just structural fields",
+			desired: topology.Topology{Nodes: []topology.Node{node("h1", withImage("debian"), withConfig(topology.Config{"hostname": "web"}))}},
+			actual:  topology.Topology{Nodes: []topology.Node{node("h1")}},
+			want:    []string{"DestroyNode:h1", "CreateNode:h1", "UpdateNodeConfig:h1"},
 		},
 		{
 			name: "cold type change forces recreate",

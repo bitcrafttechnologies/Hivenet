@@ -4,6 +4,66 @@ Every change to code, schema, dependencies or build process gets an entry here,
 written in the same session as the change. Newest first. Record the *why* —
 that's the part a diff can't recover later.
 
+## 2026-08-11 -- Netlink adapter: build order step 5
+
+Two hosts now ping each other end to end. `CreateLink` builds a veth pair in
+the Hivenet process's own netns, moves one end into each endpoint node's netns
+(the symlinks step 4 left under /var/run/netns), and tags each end with the
+link's JSON as its kernel alias so `ReadActual` can reconstruct link geometry
+after a crash with no in-memory cache (CLAUDE.md, "Never trust in-memory state as ground truth"). `DestroyLink` searches every owner node's netns for the
+aliased end rather than trusting a caller-supplied endpoint, since after a
+crash nothing but the kernel's own state can be trusted. `UpdateNodeConfig`
+applies per-interface IP/CIDR live via `AddrReplace`, keyed off the same veth
+alias. Manually validated on this VM: PUT a two-host-one-link topology with
+day-one IP config, confirmed both veth ends carried the real addresses (not
+just link-local), pinged h1 to h2 with 0% loss, removed the link and watched
+both netns drop back to just `lo`, then destroyed the nodes and confirmed
+`podman ps` and `/var/run/netns` were empty again.
+
+### Fixed
+
+**`internal/reconcile/diff.go`** -- a node created (or recreated) in the same
+`Diff()` call that also set its day-one hot config never actually got that
+config applied: both the "node doesn't exist" and "cold field changed, node is
+being recreated" branches ended in `continue` before the `hotChange` check
+further down ever ran, so an interface IP submitted alongside a brand-new node
+silently sat unconfigured until some later, unrelated write happened to nudge
+the reconciler again. Caught by manually creating h1/h2 with IP config in the
+same PUT that created them and finding no IPv4 address on either veth end.
+Added `needsConfigApply`, which checks the desired node's own Config and
+interface Configs directly instead of diffing against a zero-value Node --
+diffing against zero would also flag the bare structural interface entries
+CreateLink is responsible for as "changed," which is what the first, reverted
+attempt at this fix did and why it broke five existing table-driven cases.
+Two new cases cover both branches: a fresh node with day-one config, and a
+cold-recreated node with config on the new side.
+
+### Added
+
+**`internal/driver/podman/netlink.go`** -- the netlink half of `driver.Driver`
+(spec section 11 item 5): `CreateLink`/`DestroyLink` for veth pairs and netns
+moves, `UpdateNodeConfig` for live per-interface IP, and
+`readNetnsLinksBestEffort` which decodes the alias podman.go's `ReadActual`
+now folds into every node's link set. `go.mod` picks up
+`github.com/vishvananda/netlink` and `github.com/vishvananda/netns` for this.
+
+### Changed
+
+**`internal/driver/podman/podman.go`** -- `ReadActual` composes nodes (from
+container labels, as before) with links (from `readNetnsLinksBestEffort`
+against each node's netns) into one `topology.Topology`. `CreateNode` now
+also calls `ensureNetnsSymlink` so `CreateLink` has something under
+/var/run/netns to address, and `DestroyNode` removes that symlink so a
+leftover entry doesn't outlive its container and leak forever. `CreateLink`,
+`DestroyLink`, and `UpdateNodeConfig` moved out of this file entirely, in
+favor of the real implementations in netlink.go.
+
+**`cmd/hivenet/driver_linux.go`** -- `driverName` no longer says netlink is
+unimplemented; it names both adapters and the build order steps they cover.
+
+**`CLAUDE.md`** -- build order steps 4 and 5 marked done, with a short note on
+how each was validated on the VM.
+
 ---
 
 ## 2026-08-10 -- Podman adapter: build order step 4
