@@ -1,3 +1,39 @@
+## 2026-08-12 -- Svelte frontend: canvas, palette, outline panel: build order step 8
+
+The frontend (`web/frontend`, Svelte 5 + Vite + Svelte Flow) was already scaffolded on this branch --
+Shell/CanvasNode/Palette/OutlinePanel/Toolbar components, `state.svelte.js`, and the `api.js`/`ws.js`
+clients were all present and wired together, just uncommitted and unverified. This session ran the whole
+loop end to end on the VM (drag a node from the palette, watch it go pending -> up as the reconciler
+creates the real podman container, connect two nodes into a veth link, delete via the outline panel's
+hover action and via canvas Backspace) and fixed the two bugs that surfaced during that verification.
+
+### Fixed
+
+**`web/frontend/src/lib/state.svelte.js`'s `genId`** -- used `crypto.randomUUID()`, which browsers restrict
+to secure contexts. Loading the app over plain HTTP from a LAN IP (the VM's actual deployment shape, not
+`localhost`) left `crypto.randomUUID` undefined, so dragging any node onto the canvas threw and silently
+did nothing. Switched to `crypto.getRandomValues`, which carries no such restriction.
+
+**`web/frontend/src/lib/api.js`'s `getTopology`/`putTopology`** -- the backend marshals a nil Go slice as
+JSON `null`, so an empty topology round-trips as `{"nodes":null,"links":null}` rather than `{"nodes":[],...}`.
+`OutlinePanel.svelte` reads `topology.nodes.length` directly rather than via the `?? []` guard used
+everywhere else in this codebase, so the first document load crashed the canvas before a single node could
+be placed. Added a `normalizeTopologyDoc` helper so every document leaving `api.js` already has
+array-typed `nodes`/`links`, instead of relying on each consumer to remember the guard.
+
+### Changed
+
+**`CLAUDE.md`** -- checked off build order step 8.
+
+### Verified manually on the VM
+
+Dragged all four node types (host, router, switch, internet/NAT edge) onto the canvas and watched each
+reconcile from a dashed pending outline to a solid green up border as podman/netlink created the real
+container; connected two nodes into a link that came up solid immediately after; deleted a node from the
+outline panel's hover "x" and confirmed its touching link went with it; deleted a node via canvas
+selection + Backspace. `podman ps` / `ip netns` were empty again after each teardown. `go test ./...` and
+`npm run build` both stayed green throughout.
+
 ## 2026-08-11 -- Traffic-stats polling + `traffic_stats` push: build order step 7
 
 The reconciler now samples real kernel byte counters off every up link once a

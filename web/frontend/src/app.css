@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/* Visual tokens from HIVENET_MVP_SPEC.md section 10: light neutral background,
+   white rounded cards with soft shadow, one accent color per node/link
+   state, small dense sans-serif, pill-shaped segmented controls. */
+:root {
+  --hv-bg: #f8f7f7;
+  --hv-card: #ffffff;
+  --hv-border: #e5e3e1;
+  --hv-text: #24211f;
+  --hv-text-dim: #6b6763;
+  --hv-up: #1c9d5a;
+  --hv-error: #d1453b;
+  --hv-pending: #d99a1f;
+  --hv-traffic: #2f6fed;
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--hv-bg);
+  color: var(--hv-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+  font-size: 13px;
+}
+
+.hv-card {
+  background: var(--hv-card);
+  border: 1px solid var(--hv-border);
+  border-radius: 12px;
+  box-shadow: 0 2px 10px rgba(20, 18, 16, 0.06);
+}
+
+.hv-pill {
+  border-radius: 999px;
+}
+
+.hv-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  display: inline-block;
+  flex: none;
+}
+.hv-dot.state-up { background: var(--hv-up); }
+.hv-dot.state-error { background: var(--hv-error); }
+.hv-dot.state-pending { background: var(--hv-pending); }
+.hv-dot.state-applying { background: var(--hv-traffic); }
